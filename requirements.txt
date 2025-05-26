@@ -3,4 +3,4 @@ pandas
 sentence-transformers
 torch
 openpyxl
-sentencepiece
+sentencepiece==0.1.99
