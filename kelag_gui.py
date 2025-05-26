@@ -2,46 +2,82 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer, util
 import streamlit as st
 
+# Für Übersetzung
+from transformers import pipeline
+
 st.set_page_config(page_title="Konten-Matching international", layout="centered")
 st.title("Automatisiertes Matching: Lokale Konten auf Konzernkonten")
 
-# 1. Sprache auswählen
+# Sprache auswählen
+sprachen_map = {
+    "Kroatisch": "hr",
+    "Italienisch": "it",
+    "Slowenisch": "sl",
+    "Bosnisch": "bs",
+    "Rumänisch": "ro",
+    "Bulgarisch": "bg",
+    "Tschechisch": "cs",
+    "Spanisch": "es",
+    "Französisch": "fr",
+    "Portugiesisch": "pt"
+}
 sprache = st.selectbox(
     "Welche Sprache verwendet dein Upload-Sheet?",
-    ["Kroatisch", "Italienisch", "Slowenisch", "Bosnisch", "Rumänisch", "Bulgarisch", "Tschechisch", "Spanisch", "Französisch", "Portugiesisch"]
+    list(sprachen_map.keys())
 )
+lang_code = sprachen_map[sprache]
 
-st.info("Bitte lade das Excel mit den lokalen Konten hoch. Erwartete Spalten: 'lokale Kontonummer', 'lokale Kontobeschreibung', 'alte Positionsnummer'.")
+st.info("Bitte lade das Excel mit den lokalen Konten hoch. Erwartete Spalten: 'lokale Kontonummer', 'lokale Kontobezeichnung', 'alte Positionsnummer'.")
 
-# 2. Excel-Upload
+# Excel-Upload
 uploaded_file = st.file_uploader("Lade dein Excel mit den lokalen Konten hoch", type=["xlsx"])
 
-# 3. Excel-Datenbasis laden
-datenbasis_pfad = "Konzernkontenplan_template.xlsx"  # Passe ggf. an
+# Excel-Datenbasis laden
+datenbasis_pfad = "Konzernkontenplan_template.xlsx"
 datenbasis = pd.read_excel(datenbasis_pfad)
 
-# Modell laden (multilingual!)
+# Modell laden (multilingual, semantisch!)
 modell_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 @st.cache_resource
 def lade_modell():
     return SentenceTransformer(modell_name)
 modell = lade_modell()
 
+# Übersetzer laden (cache für Geschwindigkeit)
+@st.cache_resource
+def get_translator(src_lang):
+    if src_lang == "de":
+        # Keine Übersetzung notwendig
+        return None
+    model_name = f"Helsinki-NLP/opus-mt-{src_lang}-de"
+    return pipeline("translation", model=model_name)
+
 if uploaded_file is not None:
     try:
         lokalkonten = pd.read_excel(uploaded_file)
-        # Überprüfen, ob alle nötigen Spalten vorhanden sind
-        spalten = ["lokale Kontonummer", "lokale Kontobeschreibung", "alte Positionsnummer"]
+        spalten = ["lokale Kontonummer", "lokale Kontobezeichnung", "alte Positionsnummer"]
         if not all([sp in lokalkonten.columns for sp in spalten]):
             st.error(f"Fehlende Spalten im Upload. Erwartet: {spalten}")
         else:
-            # Ergebnis-DataFrame vorbereiten
+            # Fortschrittsbalken initialisieren
+            progress_bar = st.progress(0)
+            n = len(lokalkonten)
             ergebnis_liste = []
-            # Über alle lokalen Konten iterieren
+            translator = get_translator(lang_code)
+
             for idx, row in lokalkonten.iterrows():
                 posnummer_alt = row["alte Positionsnummer"]
-                beschreibung_lokal = str(row["lokale Kontobeschreibung"])
+                bezeichnung_lokal = str(row["lokale Kontobezeichnung"])
                 kontonummer_lokal = row["lokale Kontonummer"]
+
+                # Übersetzung ins Deutsche (für Ausgabe)
+                if translator is not None:
+                    try:
+                        uebersetzung = translator(bezeichnung_lokal, max_length=128)[0]['translation_text']
+                    except Exception:
+                        uebersetzung = "(Übersetzung nicht möglich)"
+                else:
+                    uebersetzung = bezeichnung_lokal  # bereits Deutsch
 
                 # Datenbasis auf diese alte Positionsnummer filtern (alt)
                 datenbasis_match = datenbasis[datenbasis.iloc[:,0] == posnummer_alt].copy()
@@ -49,7 +85,8 @@ if uploaded_file is not None:
                     bester_treffer = {
                         "lokale Kontonummer": kontonummer_lokal,
                         "alte Positionsnummer": posnummer_alt,
-                        f"lokale Kontobeschreibung ({sprache})": beschreibung_lokal,
+                        f"lokale Kontobezeichnung ({sprache})": bezeichnung_lokal,
+                        "Lokale Sachkontobezeichnung (deutsch)": uebersetzung,
                         "Sachkontonummer neu": "",
                         "Sachkontobezeichnung neu": "",
                         "Beschreibung neu": "",
@@ -57,7 +94,7 @@ if uploaded_file is not None:
                         "Info": "Keine passende Position in Datenbasis gefunden"
                     }
                 else:
-                    # Vergleichstext der Datenbasis-Konten bauen (für das semantische Matching)
+                    # Vergleichstext der Datenbasis-Konten bauen
                     def kombi(row_db):
                         teile = [
                             str(row_db.get("Kontenbezeichnung", "")),
@@ -68,18 +105,19 @@ if uploaded_file is not None:
                         return " ".join([t for t in teile if t and str(t).lower() != 'nan'])
                     datenbasis_match["vergleichstext"] = datenbasis_match.apply(kombi, axis=1)
 
-                    # Multilingualen Vergleich: lokale Beschreibung (in Sprache) vs. Konzern-Kontenbeschreibung (deutsch/englisch/mehrsprachig)
+                    # Semantisches Matching: lokale Bezeichnung (übersetzt oder original) vs. Vergleichstext
+                    matching_text = bezeichnung_lokal
                     datenbasis_embeddings = modell.encode(datenbasis_match["vergleichstext"].tolist(), convert_to_tensor=True)
-                    eingabe_embedding = modell.encode([beschreibung_lokal], convert_to_tensor=True)
+                    eingabe_embedding = modell.encode([matching_text], convert_to_tensor=True)
                     scores = util.pytorch_cos_sim(eingabe_embedding, datenbasis_embeddings)[0]
                     best_idx = scores.argmax().item()
                     bester_score = float(scores[best_idx])
 
-                    # Schreibe Ergebnis
                     bester_treffer = {
                         "lokale Kontonummer": kontonummer_lokal,
                         "alte Positionsnummer": posnummer_alt,
-                        f"lokale Kontobeschreibung ({sprache})": beschreibung_lokal,
+                        f"lokale Kontobezeichnung ({sprache})": bezeichnung_lokal,
+                        "Lokale Sachkontobezeichnung (deutsch)": uebersetzung,
                         "Sachkontonummer neu": datenbasis_match.iloc[best_idx]["Sachkontonummer"],
                         "Sachkontobezeichnung neu": datenbasis_match.iloc[best_idx]["Kontenbezeichnung"],
                         "Beschreibung neu": datenbasis_match.iloc[best_idx]["Beschreibung"],
@@ -87,10 +125,12 @@ if uploaded_file is not None:
                         "Info": ""
                     }
                 ergebnis_liste.append(bester_treffer)
+                progress_bar.progress((idx + 1) / n)
 
             ergebnis_df = pd.DataFrame(ergebnis_liste)
-            st.success(f"Fertig! Es wurden {len(ergebnis_df)} Konten gematcht.")
+            progress_bar.empty()  # Fortschrittsbalken ausblenden
 
+            st.success(f"Fertig! Es wurden {len(ergebnis_df)} Konten gematcht.")
             st.dataframe(ergebnis_df, hide_index=True)
 
             # Download-Option für Ergebnis
